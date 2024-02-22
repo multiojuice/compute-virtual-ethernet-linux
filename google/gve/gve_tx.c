@@ -786,6 +786,7 @@ static int gve_tx_fill_xdp_multi_buffer(struct gve_priv *priv, struct gve_tx_rin
 	tot_len = first_desc.len;
 	bool eop = !(first_desc.options & XDP_PKT_CONTD);;
 	while(!eop) {
+		netdev_warn(priv->dev, "MULTIBUFFER DETECTED");
 		// GVE only supports two buffers for payloads.
 		if (payload_i >= 1) {
 			netdev_warn(priv->dev, "TOO MANY BUFFERS");
@@ -833,11 +834,13 @@ static int gve_tx_fill_xdp_multi_buffer(struct gve_priv *priv, struct gve_tx_rin
 					     CHECKSUM_NONE, false, 0, ndescs,
 					     info->iov[iovi].iov_len,
 					     info->iov[iovi].iov_offset, tot_len);
-		else
+		else {
+			netdev_warn(priv->dev, "BOOM");
 			gve_tx_fill_seg_desc(&tx->desc[reqi & tx->mask],
 					     0, 0, false, false,
 					     info->iov[iovi].iov_len,
 					     info->iov[iovi].iov_offset);
+		}
 
 		memcpy(tx->tx_fifo.base + info->iov[iovi].iov_offset,
 		       data + offset, info->iov[iovi].iov_len);
@@ -897,6 +900,7 @@ int gve_xdp_xmit(struct net_device *dev, int n, struct xdp_frame **frames,
 	tx = &priv->tx[qid];
 
 	spin_lock(&tx->xdp_lock);
+	netdev_warn(priv->dev, "RECEIVED PACKET in gve_xdp_xmit");
 	for (i = 0; i < n; i++) {
 		err = gve_xdp_xmit_one(priv, tx, frames[i]->data,
 				       frames[i]->len, frames[i]);
@@ -1016,6 +1020,7 @@ static int gve_xsk_tx(struct gve_priv *priv, struct gve_tx_ring *tx,
 
 		bool eop = false;
 		// int ndescs = 0;
+		netdev_warn(priv->dev, "RECEIVED PACKET");
 		eop = !(first_desc.options & XDP_PKT_CONTD);
 		if (eop) {
 		  data = xsk_buff_raw_get_data(tx->xsk_pool, first_desc.addr);
