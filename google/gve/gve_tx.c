@@ -1020,8 +1020,8 @@ static int gve_xsk_tx(struct gve_priv *priv, struct gve_tx_ring *tx,
 
 		bool eop = false;
 		// int ndescs = 0;
-		netdev_warn(priv->dev, "RECEIVED PACKET");
 		eop = !(first_desc.options & XDP_PKT_CONTD);
+		netdev_warn(priv->dev, "RECEIVED PACKET %d", eop);
 		if (eop) {
 		  data = xsk_buff_raw_get_data(tx->xsk_pool, first_desc.addr);
 			nsegs = gve_tx_fill_xdp(priv, tx, data, first_desc.len, NULL, true);
@@ -1064,6 +1064,7 @@ static int gve_xsk_tx(struct gve_priv *priv, struct gve_tx_ring *tx,
 		sent++;
 	}
 out:
+		netdev_warn(priv->dev, "OUT");
 	if (sent > 0) {
 		gve_tx_put_doorbell(priv, tx->q_resources, tx->req);
 		xsk_tx_release(tx->xsk_pool);
