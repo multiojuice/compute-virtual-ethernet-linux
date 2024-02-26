@@ -132,6 +132,7 @@ static int gve_tx_alloc_fifo(struct gve_tx_fifo *fifo, size_t bytes,
 	return nfrags;
 }
 
+
 /* gve_tx_free_fifo - Return space to Tx FIFO
  * @fifo: FIFO to return fragments to
  * @bytes: Bytes to free
@@ -722,6 +723,8 @@ netdev_tx_t gve_tx(struct sk_buff *skb, struct net_device *dev)
 	return NETDEV_TX_OK;
 }
 
+#define GVE_TX_START_THRESH	PAGE_SIZE
+
 static int gve_tx_fill_xdp(struct gve_priv *priv, struct gve_tx_ring *tx,
 			   void *data, int len, void *frame_p, bool is_xsk)
 {
@@ -769,6 +772,118 @@ static int gve_tx_fill_xdp(struct gve_priv *priv, struct gve_tx_ring *tx,
 	return ndescs;
 }
 
+static int gve_tx_fill_xdp_multi_buffer(struct gve_priv *priv, struct gve_tx_ring *tx,
+			  struct xdp_desc first_desc)
+{
+	int pad, hdr_nfrags, payload_nfrags, ndescs, tot_len,  payload_i, iovi, offset;
+	void* data;
+	struct xdp_desc payload_descs[1];
+
+	struct gve_tx_buffer_state *info;
+	payload_i = 0;
+	// Calculate total length of packet by summing all buffers.
+	// TODO make this accept more than one sg
+	tot_len = first_desc.len;
+	bool eop = !(first_desc.options & XDP_PKT_CONTD);;
+	while(!eop) {
+		netdev_warn(priv->dev, "MULTIBUFFER DETECTED");
+		// GVE only supports two buffers for payloads.
+		if (payload_i >= 1) {
+			netdev_warn(priv->dev, "TOO MANY BUFFERS");
+			goto out;
+		}
+		if (!gve_can_tx(tx, GVE_TX_START_THRESH))
+				goto out;
+
+			if (!xsk_tx_peek_desc(tx->xsk_pool, &payload_descs[payload_i])) {
+				tx->xdp_xsk_done = tx->xdp_xsk_wakeup;
+				goto out;
+			}
+		tot_len += payload_descs[payload_i].len;
+		eop = payload_descs[payload_i].options == 0;
+		++payload_i;
+		netdev_warn(priv->dev, "Tot_len: %d", tot_len);
+	}
+
+	u32 reqi = tx->req;
+	pad = gve_tx_fifo_pad_alloc_one_frag(&tx->tx_fifo, first_desc.len);
+	if (pad >= GVE_GQ_TX_MIN_PKT_DESC_BYTES)
+		pad = 0;
+	info = &tx->info[reqi & tx->mask];
+	info->xdp_frame = NULL;
+	info->xdp.is_xsk = true;
+	info->xdp.size = tot_len;
+
+
+	int payload_iov = 2;
+
+	hdr_nfrags = gve_tx_alloc_fifo(&tx->tx_fifo, pad + first_desc.len,
+				   &info->iov[0]);
+	// Might be able to just let that check return 0
+	if (payload_i > 0) {
+		payload_nfrags = gve_tx_alloc_fifo(&tx->tx_fifo, tot_len - first_desc.len,
+						&info->iov[payload_iov]);
+	}
+	iovi = pad > 0;
+	ndescs = hdr_nfrags - iovi + payload_nfrags;
+	offset = 0;
+	data = xsk_buff_raw_get_data(tx->xsk_pool, first_desc.addr);
+	while (iovi < hdr_nfrags) {
+		if (!offset)
+			gve_tx_fill_pkt_desc(&tx->desc[reqi & tx->mask], 0,
+					     CHECKSUM_NONE, false, 0, ndescs,
+					     info->iov[iovi].iov_len,
+					     info->iov[iovi].iov_offset, tot_len);
+		else {
+			netdev_warn(priv->dev, "BOOM");
+			gve_tx_fill_seg_desc(&tx->desc[reqi & tx->mask],
+					     0, 0, false, false,
+					     info->iov[iovi].iov_len,
+					     info->iov[iovi].iov_offset);
+		}
+
+		memcpy(tx->tx_fifo.base + info->iov[iovi].iov_offset,
+		       data + offset, info->iov[iovi].iov_len);
+		gve_dma_sync_for_device(&priv->pdev->dev,
+					tx->tx_fifo.qpl->page_buses,
+					info->iov[iovi].iov_offset,
+					info->iov[iovi].iov_len);
+		offset += info->iov[iovi].iov_len;
+		iovi++;
+		reqi++;
+	}
+
+	if (payload_i > 0) {
+		iovi = 2;
+		offset = 0;
+		data = xsk_buff_raw_get_data(tx->xsk_pool, payload_descs[0].addr);
+		netdev_warn(priv->dev, "Processing a payload buffer pre loop");
+		while (payload_nfrags > 0 && iovi < payload_nfrags + payload_iov) {
+			netdev_warn(priv->dev, "Processing a payload buffer");
+			gve_tx_fill_seg_desc(&tx->desc[reqi & tx->mask],
+					0, 0, false, false,
+					info->iov[iovi].iov_len,
+					info->iov[iovi].iov_offset);
+			memcpy(tx->tx_fifo.base + info->iov[iovi].iov_offset,
+						data + offset, info->iov[iovi].iov_len);
+					gve_dma_sync_for_device(&priv->pdev->dev,
+								tx->tx_fifo.qpl->page_buses,
+								info->iov[iovi].iov_offset,
+								info->iov[iovi].iov_len);
+			offset += info->iov[iovi].iov_len;
+			iovi++;
+			reqi++;
+		}
+	}
+
+	return ndescs;
+  out:
+    // ADD PRINT
+	netdev_warn(priv->dev, "OUt in mutlibuffer handling");
+    return 0;
+}
+
+
 int gve_xdp_xmit(struct net_device *dev, int n, struct xdp_frame **frames,
 		 u32 flags)
 {
@@ -785,6 +900,7 @@ int gve_xdp_xmit(struct net_device *dev, int n, struct xdp_frame **frames,
 	tx = &priv->tx[qid];
 
 	spin_lock(&tx->xdp_lock);
+	netdev_warn(priv->dev, "RECEIVED PACKET in gve_xdp_xmit");
 	for (i = 0; i < n; i++) {
 		err = gve_xdp_xmit_one(priv, tx, frames[i]->data,
 				       frames[i]->len, frames[i]);
@@ -818,8 +934,6 @@ int gve_xdp_xmit_one(struct gve_priv *priv, struct gve_tx_ring *tx,
 
 	return 0;
 }
-
-#define GVE_TX_START_THRESH	PAGE_SIZE
 
 static int gve_clean_tx_done(struct gve_priv *priv, struct gve_tx_ring *tx,
 			     u32 to_do, bool try_to_wake)
@@ -889,7 +1003,8 @@ u32 gve_tx_load_event_counter(struct gve_priv *priv,
 static int gve_xsk_tx(struct gve_priv *priv, struct gve_tx_ring *tx,
 		      int budget)
 {
-	struct xdp_desc desc;
+	struct xdp_desc first_desc;
+	// struct xdp_desc curr_desc;
 	int sent = 0, nsegs;
 	void *data;
 
@@ -898,18 +1013,61 @@ static int gve_xsk_tx(struct gve_priv *priv, struct gve_tx_ring *tx,
 		if (!gve_can_tx(tx, GVE_TX_START_THRESH))
 			goto out;
 
-		if (!xsk_tx_peek_desc(tx->xsk_pool, &desc)) {
+		if (!xsk_tx_peek_desc(tx->xsk_pool, &first_desc)) {
 			tx->xdp_xsk_done = tx->xdp_xsk_wakeup;
 			goto out;
 		}
 
-		data = xsk_buff_raw_get_data(tx->xsk_pool, desc.addr);
-		nsegs = gve_tx_fill_xdp(priv, tx, data, desc.len, NULL, true);
+		bool eop = false;
+		// int ndescs = 0;
+		eop = !(first_desc.options & XDP_PKT_CONTD);
+		netdev_warn(priv->dev, "RECEIVED PACKET options %d", first_desc.options);
+		netdev_warn(priv->dev, "RECEIVED PACKET len %d", first_desc.len);
+
+		if (eop) {
+		  data = xsk_buff_raw_get_data(tx->xsk_pool, first_desc.addr);
+			nsegs = gve_tx_fill_xdp(priv, tx, data, first_desc.len, NULL, true);
+		} else {
+			nsegs = gve_tx_fill_xdp_multi_buffer(priv, tx, first_desc);
+		}
+		// union gve_tx_desc *original_desc = &tx->desc[tx->req & tx->mask];
 		tx->req += nsegs;
+		// ndescs += nsegs;
+		/*
+		// BOOM TODO might need to edit pad in gve_tx_fifo from gve_Tx_fill_xdp
+		while (!eop) {		
+			netdev_warn(priv->dev, "MULTIBUFFER DETECTED");
+			
+			
+			if (!gve_can_tx(tx, GVE_TX_START_THRESH)) {
+				netdev_warn(priv->dev, "First out");
+				goto out;
+			}
+
+			if (!xsk_tx_peek_desc(tx->xsk_pool, &curr_desc)) {
+				netdev_warn(priv->dev, "Second out");
+				tx->xdp_xsk_done = tx->xdp_xsk_wakeup;
+				goto out;
+			}
+
+			eop = !(curr_desc.options & XDP_PKT_CONTD);
+			if (!eop) {
+				pr_err("MULTIBUFFER DETECTED Second check");
+
+			}
+			data = xsk_buff_raw_get_data(tx->xsk_pool, curr_desc.addr);
+			nsegs = gve_tx_fill_xdp(priv, tx, data, curr_desc.len, NULL, true, false);
+			tx->req += nsegs;
+			ndescs += nsegs;
+		}
+		*/
+		// original_desc->pkt.desc_cnt = ndescs;
+		// netdev_warn(priv->dev, "Num Descs: %d", ndescs);
 		sent++;
 	}
 out:
 	if (sent > 0) {
+		netdev_warn(priv->dev, "OUT");
 		gve_tx_put_doorbell(priv, tx->q_resources, tx->req);
 		xsk_tx_release(tx->xsk_pool);
 	}
